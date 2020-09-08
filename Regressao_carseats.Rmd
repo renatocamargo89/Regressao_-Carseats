@@ -1,0 +1,260 @@
+---
+title: "Regressao Carseats"
+author: "Renato Camargo"
+date: "26/05/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(tinytex.verbose = TRUE)
+```
+
+# Descrição do Problema
+
+Trabalharemos com a base Carseats do pacote ISRL, uma base de dados que simula as vendas de assentos de carro infantil para 400 lojas.<br>
+Nosso objetivo será criar um modelo de regressão para predizer a variável 'Advertsiment', o orçamento para publicidade dedicado a cada local.
+Portanto, queremos responder qual o investimento habitual em publicidade de uma dada localidade baseado em suas características e estratégia de preço.
+
+# Importação do banco de dados
+
+```{r bibliotecas,warning=FALSE, message=FALSE}
+# Base de dados
+library(ISLR)
+
+# Análise exploratória
+library(skimr)
+library(GGally)
+
+#Métodos de regressão
+library(tidyverse)
+library(tidymodels)
+library(doParallel)
+library(vip)
+library(kernlab)
+
+```
+
+# Análise descritiva
+```{r analise descritiva 1}
+skim(Carseats)
+```
+
+O banco de dados tem 400 observações e 11 variáveis (3 fatores e 11 numéricos) e nenhum dado faltante. 
+Também vemos que as variáveis fatores possuem distribuição significativa entre todos os seus valores, de maneira que não será necessário fazer agrupamentos para a modelagem.
+
+As onze variáveis são: 
+
+- Sales: Vendas por Unidades (em milhares) de cada localização
+- CompPrice: preço praticado por competidor em cada localidade
+- Income: Nível de renda da comunidade (milhares de dólares)
+- Advertising: Orçamento local para publicidade (em milhares de dólares)
+- Population: tamanho da população local (em milhares)
+- Price: preço praticado por assento infantil
+- Age: idade média da população local
+- Education: nível educacional da localização
+- ShelveLoc: fator (ruim, mediano, bom) que indica a qualidade da localização da prateleira do assento de carro infantil na prateleira. 
+- Urban: fator (sim, não) que indica se uma loja está em um local urbano ou não (ou seja, rural)
+- US:fator (sim, não) que indica se a loja é nos EUA ou não.
+
+
+
+Agora vamos fazer a análise relacionando as variáveis, usando o pacote GGalary:
+```{r analise descritiva 2, fig.width=10,fig.height=11}
+
+GGally::ggpairs( Carseats, progress = FALSE, 
+                upper = list(alignPercent=1), 
+                lower = list(combo = wrap("facethist", binwidth = 5)))
+```
+
+- Da primeira tabela, vemos que ao menos 1 quarto das lojas não investem em publicidade. Com o gráfico de dispersão do GGPairs notamos que além desse pico em investimento zero, também há um segundo pico de concentração mais próximo ao centro. Possivelmente temos dois grupos que investem ou não em publicidade com comportamentos distintos. 
+
+- Não vemos correlações elevadas que devam interferir em nosso modelos. A correlação mais elevada é 'preço' vs 'preço dos concorrentes' com 0,58 e depois nenhuma correlação superior a 0,3. 
+No entanto podemos fazer algumas inferências iniciais:
+
+  - Investimento em publicidade tem uma maior correlação com Vendas e Tamanho Populacional. Talvez localidades em maiores mercados tendem a investir mais em publicidade e lojas com grandes vendas fazem mais investimento em publicidade. Vale ressaltar que Vendas não tem uma alta correlação com tamanho da população.
+
+  - Investimento em publicidade tem correlação negativa com preço de concorrentes e Idade Populacional, mesmo sendo correlações baixas. Assim, podemos também inferir de que lojas em mercados com preços mais elevados sentem menor necessidade de investimento.
+
+  - Podemos ver um comportamento muito distinto no investimento em publicidade para lojas dentro e fora dos EUA
+
+Com isso em mente, começamos a construção do modelo.
+
+# Definição da base de treino e teste
+quebraremos em 80% treino (tr) e 20% teste (ts)
+```{r treino teste}
+set.seed(1)
+split <- initial_split(Carseats, prop = 0.8)
+
+tr <- training(split) #treino
+ts <- testing(split) #test
+
+head(tr)
+```
+
+
+# Processamento
+Para o processamento, usaremos o Tidymodels, normalizando as variáveis numéricas e preparando 10 grupos para fazer validações cruzadas
+```{r}
+
+receita <- recipe(Advertising ~ ., tr) %>% 
+            step_normalize(all_numeric()) %>% 
+            step_dummy(all_nominal())
+
+
+receita_prep <- prep(receita)
+
+tr_process <- juice(receita_prep)
+ts_process <- bake(receita_prep, new_data = ts)
+
+cv_split <- vfold_cv(tr, v = 10)
+```
+
+
+# Modelos
+Para predizer a variável 'Advertsiment', usaremos a Random Forest e SVM
+
+## Random Forest
+Usaremos o pacote Ranger através do Tidymoldes, selecionando o número de preditores e observações mínimas por validação cruzada usando o Erro quadrático médio como métrica.
+```{r}
+
+set.seed(1)
+#definição do modelo
+rf <- rand_forest(mtry = tune(), min_n = tune()) %>%
+  set_mode("regression") %>% 
+  set_engine("ranger",importance = "permutation")
+
+doParallel::registerDoParallel()
+
+##computando diferentes combinacoes de parametros mtry e min_n
+grid_rf <- tune_grid(rf, 
+                     receita,
+                     resamples = cv_split, 
+                     grid = 20)
+
+#avisao grafica do resultado
+autoplot(grid_rf)
+
+
+grid_rf %>% 
+  collect_metrics()
+
+
+#selecao do melhor hiperparametro
+best_rf <- grid_rf %>% 
+  select_best(metric = "rmse")
+best_rf
+```
+
+assim definimos a quantidade ótima de variáveis e observações mínimas para atingir o melhor erro quadrático médio.
+
+```{r}
+#finalizando o modelo
+rf_fit <- finalize_model(rf, parameters = best_rf)
+
+#ajustando o modelo
+rf_fit <- fit(rf_fit, 
+              Advertising ~ ., 
+              data = tr_process)
+
+fitted <- rf_fit %>% 
+            predict(new_data = ts_process) %>%
+              mutate(observado = ts_process$Advertising, 
+                modelo = "random forest")
+
+rf_fit$fit
+
+# importância
+vip(rf_fit)
+```
+
+Assim, dentro do nosso modelo de Random Forest a variável mais importante é Ser uma loja nos EUA (~40%), seguido por Vendas e Tamanho da População (~5% cada).
+
+Aplicando nosso modelo na amostra teste:
+
+```{r}
+x = rf_fit %>% 
+            predict(new_data = ts_process) %>%
+              mutate(observado = ts_process$Advertising)
+rmse(x, truth = observado, estimate = .pred)
+
+```
+
+Temos um erro quadrático médio elevado.
+
+
+## SVM
+Par ao SVM vamos usar o modelo Polinomial através do Tidymodel, ajustando o 'custo' para atingir o melhor erro quadrático médio.
+
+```{r}
+#definição do modelo
+svm <- svm_poly( cost = tune()) %>%  
+        set_args(kernel = "vanilladot") %>% 
+        set_mode("regression") %>% 
+        set_engine("kernlab")
+
+
+##computando diferentes parametros do custo
+grid_svm <- tune_grid(svm, 
+                     receita,
+                     resamples = cv_split, 
+                     grid = 10)
+#visao grafica do resultado
+autoplot(grid_svm)
+
+grid_svm%>% 
+  collect_metrics()
+
+#selecao do melhor hiperparametro
+best <- grid_svm %>% 
+          select_best(metric = "rmse")
+best
+```
+
+achamos o custo para minimizar o erro quadratico médio.
+
+
+```{r}
+#finalizando o modelo
+svm_fit <- finalize_model(svm, parameters = best)
+
+#ajustando o modelo
+svm_fit <- fit(svm_fit, 
+               Advertising ~ ., 
+               data = tr_process)
+
+#juntando os dois modelos para avaliação
+fitted <- bind_rows(fitted, 
+                    svm_fit %>% 
+                     predict(new_data = ts_process) %>%
+                     mutate(observado = ts_process$Advertising, 
+                             modelo = "svm - linear"))
+
+
+
+x = svm_fit %>% 
+            predict(new_data = ts_process) %>%
+              mutate(observado = ts_process$Advertising)
+rmse(x, truth = observado, estimate = .pred)
+```
+
+com o SVM vemos um resultado muito similar da Random Forest com um erro quadrático médio também elevado.
+
+
+# Avaliação
+
+comparação do desemepenho dos dois modelos: Random Forest e SVM
+
+```{r}
+fitted %>% 
+  group_by(modelo) %>% 
+  rmse(truth = observado, estimate = .pred) %>% 
+  ggplot(aes(reorder(modelo, -.estimate), .estimate, fill = modelo )) + 
+    geom_col(show.legend = FALSE) + 
+    labs(x = "", y = "rmse") + 
+    coord_flip()
+```
+
+
+Na comparação vemos que os dois modelos apresentam resultados muito semelhante, sendo praticamente permutáveis na prediçao da variável Advertisment. 
+
